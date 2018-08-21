@@ -1,0 +1,283 @@
+止めたいのに止められないテストの話
+golang.tokyo #17
+22 Aug 2018
+Tags: golang, test, failfast
+
+* 自己紹介
+鎌田健史
+@knsh14 (twitter, GitHub)
+試用期間なので野生の Gopher
+
+* 事の発端
+- プロダクトは test 長くなりがち
+- go test を早く終わらせたい
+- 失敗したなら即テストを終わって修正にかかりたい
+- python だと `py.test` `-x` 的なやつ
+- tenntenn に相談する
+
+* go test -failfast
+ -failfast
+     Do not start new tests after the first test failure.
+go test を最初に失敗したところで終わる
+
+すごくそれっぽい
+
+* 実際に試してみた
+がどうにもうまくいく気配がない
+
+テスト時間も短くなってないし、ログの行数も変わらない
+
+最小構成で試してみる
+
+* 実験してみる
+対象のコマンド
+
+ $ go version
+ go version go1.10.3 darwin/amd64
+ $ go run -v -failfast ./
+
+テストログをだして、最初に失敗したところでテストを終了させる
+
+* 問題 1
+ package main
+ 
+ import "testing"
+ 
+ func TestA(t *testing.T) {
+ 	t.Log("A start")
+ 	t.Fail() // ここでテストを失敗させる
+ 	t.Log("A End")
+ }
+
+ func TestB(t *testing.T) {
+ 	t.Log("B start")
+ 	t.Log("B End")
+ }
+
+
+* 結果
+ knsh14% go test -v -failfast ./
+ === RUN   TestA
+ --- FAIL: TestA (0.00s)
+         sample_test.go:6: A start
+         sample_test.go:8: A End
+ FAIL
+ FAIL    github.com/knsh14/sample        0.010s
+
+TestA だけが実行されて TestB は実行されない
+
+* 問題 2
+ package main
+ 
+ import "testing"
+ 
+ func TestA(t *testing.T) {
+ 	t.Log("A start")
+ 	t.FailNow() // ここでテストを失敗させる
+ 	t.Log("A End")
+ }
+
+ func TestB(t *testing.T) {
+ 	t.Log("B start")
+ 	t.Log("B End")
+ }
+
+
+* 結果
+ knsh14% go test -v -failfast ./
+ === RUN   TestA
+ --- FAIL: TestA (0.00s)
+         sample_test.go:6: A start
+ === RUN   TestB
+ --- PASS: TestB (0.00s)
+         sample_test.go:12: B start
+         sample_test.go:13: B End
+ FAIL
+ FAIL    github.com/knsh14/sample        0.010s
+
+TestB まで実行される。 `-failfast` が効いてない
+
+* 2つの違い
+テストを失敗させる関数の違い
+
+- `testing.T.Fail()`
+- `testing.T.FailNow()`
+
+`testing.T.Fail()` では落ちるが、 `testing.T.FailNow()` では落ちない
+
+* 思っていたのと違う！
+`testing.T.FailNow()` でもちゃんと終わって欲しい
+コード追ってみるしかない
+
+* go test の内部の流れ
+.link https://github.com/golang/go/blob/release-branch.go1.10/src/testing/testing.go#L1033
+
+# 1. 実行するテストの一覧を取得する
+# 2. この一覧に対して tRunner 関数に t.Run で実行する関数を渡す
+# 3. tRunner 関数は渡された関数を実行して、defer で終了したときの処理をする
+# 4. t.Run は中で goroutine で testing.tRunner 関数に対象のテスト関数を渡して実行する
+
+
+ tests := getTestList() // テスト一覧を取得
+ for _, test := range tests {
+    test := test
+    checkFailFast() // ループを抜けるか決める
+
+    go func() {
+        Run(test)
+        // 後処理
+    }()
+ }
+
+* Fail() で失敗する時
+* Fail() の実装
+.link https://golang.org/src/testing/testing.go?s=18061:18084#L491
+ func (t *T) Fail() {
+ 	...
+ 	t.failed = true
+ }
+`Fail()` は単に `T.failed` `=` `true` にするだけ
+
+* go test の方での処理
+.link https://github.com/golang/go/blob/release-branch.go1.10/src/testing/testing.go#L777
+ func tRunner(t *T, fn func(t *T)) {
+ 	defer func() {
+ 		// 終了処理
+ 	}()
+ 
+ 	fn(t)
+ 
+ 	if t.failed {
+ 		atomic.AddUint32(&numFailed, 1)
+ 	}
+ 	t.finished = true
+ }
+- テスト関数が終了する
+- `t.failed` が `true` なので、`numFailed` が加算される
+
+* 次のテストに行くときの処理
+次のテストが実行される時に `failfast` のチェックを行う
+
+ func (t *T) Run(name string, f func(t *T)) bool {
+ 	testName, ok, _ := t.context.match.fullName(&t.common, name)<Paste>
+ 	if !ok || shouldFailFast() { // <- ここのshouldFailTest() が true になる
+ 		return true
+ 	}
+     ... // テスト実行処理
+ }
+
+*shouldFailFast* *の実装*
+.link https://github.com/golang/go/blob/release-branch.go1.10/src/testing/testing.go#L1270
+
+ func shouldFailFast() bool {
+ 	return *failFast && atomic.LoadUint32(&numFailed) > 0
+ }
+パッケージ変数の `numFailed` の数をチェックしている
+
+* FailNow() で終わる時
+* FailNow() の実装
+.link https://golang.org/src/testing/testing.go?s=18952:18978#L520
+`Fail()` した後強制的に `goroutine` を終了することでテストを終了している
+
+ func (t *T) FailNow() {
+ 	t.Fail()
+ 	t.finished = true
+ 	runtime.Goexit()
+ }
+
+* go test 側での処理
+defer 関数は実行されるので、大抵の失敗時処理はされるが、失敗のカウントは実行されない
+
+ func tRunner(t *T, fn func(t *T)) {
+ 	defer func() {
+         ... 終了処理
+ 	}()
+ 	fn(t) <- ここで強制終了される
+ 
+ 	if t.failed {
+ 		atomic.AddUint32(&numFailed, 1)
+ 	}
+ 	t.finished = true
+ }
+
+なので、failfast チェックをすり抜けてしまう
+
+* 次のテストに行くときの処理
+次の `t.Run` が実行される時に `failfast` のチェックを行う
+
+ func (t *T) Run(name string, f func(t *T)) bool {
+ 	testName, ok, _ := t.context.match.fullName(&t.common, name)<Paste>
+ 	if !ok || shouldFailFast() { // <- ここのshouldFailTest() が false のまま
+ 		return true
+ 	}
+     ... // テスト実行処理
+ }
+
+* goroutine を runtime.Goexit() で終わるとどうなるか
+ package main
+ 
+ import (
+ 	"fmt"
+ 	"runtime"
+ 	"time"
+ )
+ 
+ func main() {
+ 	fmt.Println("Hello, playground")
+ 	go func() {
+ 		defer func() { fmt.Println("defer exec") }()
+ 		fmt.Println("Goroutine Start")
+ 		Foo()
+ 		fmt.Println("Goroutine End")
+ 	}()
+ 	time.Sleep(time.Second)
+ 	fmt.Println("Bye, playground")
+ }
+ func Foo() {
+ 	fmt.Println("Foo start")
+ 	runtime.Goexit()
+ 	fmt.Println("Foo end")
+ }
+
+* 実行結果
+.link https://play.golang.org/p/Uka7L57cTGj
+
+ Hello, playground
+ Goroutine Start
+ Foo start
+ defer exec
+ Bye, playground
+
+- Foo end や Goroutine End が実行されない
+- defer はきちんと実行される
+
+* コントリビュートチャンス！と思いきや
+.link https://github.com/golang/go/issues/24412
+.link https://go-review.googlesource.com/c/go/+/101035
+
+go1.11 で直ってた
+テスト関数実行後にやっていたカウント処理を defer の中で実行する
+
+release note に乗ってない！
+
+* 結論
+`go` `test` `-failfast` はバグってたけど go1.11 で直るので使う人はもう少し待ちましょう
+
+無事終わることができました
+
+# * Fail、FailNow の違い
+# - Fail
+# 
+# .link https://golang.org/src/testing/testing.go?s=18061:18084#L491
+# - FailNow
+#  func (c *common) FailNow() {
+#  	c.Fail()
+#  	runtime.Goexit()
+#  }
+# .link https://golang.org/src/testing/testing.go?s=18952:18978#L520
+# 
+# Fail は単に失敗のマークをつけるだけ
+# FailNow は Fail した後 `runtime.Goexit()` で脱出する
+# 
+# `T.Error()` は log + T.Fail()
+# `T.Fatal()` は log + T.FailNow()
