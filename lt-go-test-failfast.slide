@@ -1,31 +1,32 @@
 止めたいのに止められないテストの話
 golang.tokyo #17
-22 Aug 2018
+21 Aug 2018
 Tags: golang, test, failfast
 
 * 自己紹介
 鎌田健史
 @knsh14 (twitter, GitHub)
-試用期間なので野生の Gopher
+野生の Gopher
 
 * 事の発端
 - プロダクトは test 長くなりがち
 - go test を早く終わらせたい
 - 失敗したなら即テストを終わって修正にかかりたい
 - python だと `py.test` `-x` 的なやつ
-- tenntenn に相談する
+- tenntenn に相談してみたところ次のフラグをおすすめされた
 
 * go test -failfast
  -failfast
      Do not start new tests after the first test failure.
 go test を最初に失敗したところで終わる
+1.10 から追加された機能
 
 すごくそれっぽい
 
-* 実際に試してみた
+* 実際にプロジェクトで 試してみた
 がどうにもうまくいく気配がない
 
-テスト時間も短くなってないし、ログの行数も変わらない
+テスト時間も短くなってないし、ログの行数も減ってない
 
 最小構成で試してみる
 
@@ -38,7 +39,7 @@ go test を最初に失敗したところで終わる
 
 テストログをだして、最初に失敗したところでテストを終了させる
 
-* 問題 1
+* 実験 1
  package main
  
  import "testing"
@@ -66,7 +67,7 @@ go test を最初に失敗したところで終わる
 
 TestA だけが実行されて TestB は実行されない
 
-* 問題 2
+* 実験 2
  package main
  
  import "testing"
@@ -159,8 +160,7 @@ TestB まで実行される。 `-failfast` が効いてない
 次のテストが実行される時に `failfast` のチェックを行う
 
  func (t *T) Run(name string, f func(t *T)) bool {
- 	testName, ok, _ := t.context.match.fullName(&t.common, name)<Paste>
- 	if !ok || shouldFailFast() { // <- ここのshouldFailTest() が true になる
+ 	if shouldFailFast() { // <- ここのshouldFailTest() が true になる
  		return true
  	}
      ... // テスト実行処理
@@ -206,8 +206,7 @@ defer 関数は実行されるので、大抵の失敗時処理はされるが�
 次の `t.Run` が実行される時に `failfast` のチェックを行う
 
  func (t *T) Run(name string, f func(t *T)) bool {
- 	testName, ok, _ := t.context.match.fullName(&t.common, name)<Paste>
- 	if !ok || shouldFailFast() { // <- ここのshouldFailTest() が false のまま
+ 	if shouldFailFast() { // <- ここのshouldFailTest() が false のまま
  		return true
  	}
      ... // テスト実行処理
